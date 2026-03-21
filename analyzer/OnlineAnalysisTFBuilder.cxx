@@ -14,11 +14,11 @@
 #include "TCanvas.h"
 #include "THttpServer.h"
 
-// NestdaqUnpacker headers
 #include "NodeUnpacker.hh"
 #include "LeafProcessor.hh"
 #include "LeafSchema.hh"
 #include "NodeHeaderSchema.hh"
+#include "SubTimeFrameHeader.h"
 
 // Helper timer
 #include "KTimer.cxx"
@@ -30,6 +30,7 @@ struct OnlineAnalysisNode : fair::mq::Device
     struct OptionKey {
         static constexpr std::string_view InputChannelName {"in-chan-name"};
         static constexpr std::string_view SamplingMode     {"sampling-mode"};
+        static constexpr std::string_view Prescale         {"prescale"};
     };
 
     OnlineAnalysisNode()
@@ -42,7 +43,8 @@ struct OnlineAnalysisNode : fair::mq::Device
         using opt = OptionKey;
         fInputChannelName = fConfig->GetValue<std::string>(opt::InputChannelName.data());
         fSamplingMode     = fConfig->GetValue<std::string>(opt::SamplingMode.data());
-        LOG(info) << "DEBUG: InitTask Started. Channel: " << fInputChannelName << " Mode: " << fSamplingMode;
+        fPrescale         = fConfig->GetValue<int>(opt::Prescale.data());
+        LOG(info) << "DEBUG: InitTask Started. Channel: " << fInputChannelName << " Mode: " << fSamplingMode << " Prescale: " << fPrescale;
 
         gROOT->SetBatch(kTRUE);
 
@@ -61,23 +63,15 @@ struct OnlineAnalysisNode : fair::mq::Device
         fDrawTimer.SetDuration(100); 
 
         // Global Histograms (All FEMs aggregated)
-        if (!fH1TDC) {
-             fH1TDC = new TH1F("h1_tdc", "TDC Distribution (All FEMs);TDC;Counts", 1000, 0, 600000000); 
-             fH1TOT = new TH1F("h1_tot", "TOT Distribution (All FEMs);TOT;Counts", 1000, 0, 100000);   
-             fH2HitPattern = new TH2F("h2_hitpat", "Hit Pattern;Channel;FEM ID", 64, 0, 64, 10, 0, 10);
+             fH2HitPattern = new TH2F("h2_hitpat", "Hit Pattern;Channel;FEM ID", 128, 0, 128, 10, 0, 10);
              
              if(fServer) {
-                 fServer->Register("/Summary", fH1TDC);
-                 fServer->Register("/Summary", fH1TOT);
                  fServer->Register("/Summary", fH2HitPattern);
                  
                  // Update monitor settings
                  fServer->SetItemField("/", "_monitoring", "1000");
                  fServer->SetItemField("/Summary", "_monitoring", "1000");
-                 // Use log scale for summary TOT
-                 fServer->SetItemField("/Summary/h1_tot", "drawopt", "logy");
              }
-        }
         
         LOG(info) << "DEBUG: InitTask Finished.";
     }
@@ -123,10 +117,20 @@ struct OnlineAnalysisNode : fair::mq::Device
                         }
                     }
                 }
+                
+                fProcessCount++;
+                if (fProcessCount % fPrescale != 0) {
+                    if (fDrawTimer.Check()) {
+                        UpdateDisplay();
+                    }
+                    return true; // Skip processing to save CPU
+                }
 
                 // Prepare Processor
                 fLeafProcessor->clear();
                 LOG(info) << "LeafProcessor cleared. Processing parts...";
+
+                std::unordered_map<uint32_t, uint32_t> current_fem_types;
 
                 // Merge all parts into a single aligned buffer
                 size_t total_size = 0;
@@ -160,6 +164,11 @@ struct OnlineAnalysisNode : fair::mq::Device
                          LOG(info) << "Found Container Header (skipping 24-byte header): 0x" << std::hex << magic << std::dec;
                          current_ptr += 3; 
                          continue;
+                    }
+
+                    if (magic == SubTimeFrame::MAGIC) {
+                        auto* pstf = reinterpret_cast<SubTimeFrame::Header*>(current_ptr);
+                        current_fem_types[pstf->femId] = pstf->femType;
                     }
 
                     // 2. Handle Recognized Headers (like SubTimeFrame)
@@ -200,7 +209,6 @@ struct OnlineAnalysisNode : fair::mq::Device
                     auto fem_ids = fLeafProcessor->get_node_ids();
                     
                     for (auto fem_id : fem_ids) {
-                        CheckAndCreateHistograms(static_cast<uint32_t>(fem_id));
                         // get_leafnode_data returns {body_vec, hbd_vec}
                         auto [body_vec, hbd_vec] = fLeafProcessor->get_leafnode_data(fem_id);
                     
@@ -212,17 +220,26 @@ struct OnlineAnalysisNode : fair::mq::Device
                             const auto& leaf_data = std::get<1>(dataset);
                             
                             if (type_name == "L-TDC" || type_name == "T-TDC") {
+                                bool is_hr = false;
+                                if (current_fem_types.count(fem_id) > 0) {
+                                    uint32_t fem_type = current_fem_types.at(fem_id);
+                                    is_hr = (fem_type == SubTimeFrame::TDC64H || fem_type == SubTimeFrame::TDC64H_V3);
+                                } else {
+                                    is_hr = (type_name == "T-TDC" || type_name == "H-TDC");
+                                }
+
+                                CheckAndCreateHistograms(static_cast<uint32_t>(fem_id), is_hr);
+
                                 if (leaf_data.count("Ch") && leaf_data.count("TDC") && leaf_data.count("TOT")) {
                                     uint32_t ch = leaf_data.at("Ch");
                                     uint32_t tdc = leaf_data.at("TDC");
                                     uint32_t tot = leaf_data.at("TOT");
                                     
-                                    if (fH1TDC) fH1TDC->Fill(tdc);
-                                    if (fH1TOT) fH1TOT->Fill(tot);
                                     if (fH2HitPattern) fH2HitPattern->Fill(ch, fem_id);
                                     if (fMapHitPattern.count(fem_id)) fMapHitPattern[fem_id]->Fill(ch);
 
-                                    if (ch < 64 && fMapTDC.count(fem_id) && fMapTDC[fem_id].size() > ch) {
+                                    int max_ch = is_hr ? 64 : 128;
+                                    if (ch < static_cast<uint32_t>(max_ch) && fMapTDC.count(fem_id) && fMapTDC[fem_id].size() > ch) {
                                         fMapTDC[fem_id][ch]->Fill(tdc);
                                         fMapTOT[fem_id][ch]->Fill(tot);
                                     }
@@ -269,27 +286,31 @@ struct OnlineAnalysisNode : fair::mq::Device
         return std::to_string(ip[3]) + "." + std::to_string(ip[2]) + "." + std::to_string(ip[1]) + "." + std::to_string(ip[0]);
     }
 
-    void CheckAndCreateHistograms(uint32_t fem_id) {
+    void CheckAndCreateHistograms(uint32_t fem_id, bool is_hr) {
         if (fMapTDC.count(fem_id) > 0) return; // Already exists
 
         std::string ip_str = ToIPAddress(fem_id);
-        LOG(info) << "Registering New FEM ID: " << fem_id << " (" << ip_str << ")";
+        int max_ch = is_hr ? 64 : 128;
+        LOG(info) << "Registering New FEM ID: " << fem_id << " (" << ip_str << ") - " << (is_hr ? "HR" : "LR");
 
-        fMapTDC[fem_id].resize(64, nullptr);
+        fMapTDC[fem_id].resize(max_ch, nullptr);
         // Create Hit Pattern histogram for this FEM
         fMapHitPattern[fem_id] = new TH1F(Form("h1_hitpat_%s", ip_str.c_str()), 
                                           Form("FEM %s Hit Pattern;Channel;Counts", ip_str.c_str()), 
-                                          64, 0, 64);
+                                          max_ch, 0, max_ch);
 
-        fMapTOT[fem_id].resize(64, nullptr);
+        fMapTOT[fem_id].resize(max_ch, nullptr);
         // Create Histograms
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < max_ch; ++i) {
+            double tdc_max = is_hr ? 600000000.0 : 250000.0;
+            double tot_max = is_hr ? 100000.0 : 200.0;
+
             fMapTDC[fem_id][i] = new TH1F(Form("h1_tdc_%s_ch%d", ip_str.c_str(), i), 
                                           Form("FEM %s TDC Ch%d;TDC;Counts", ip_str.c_str(), i), 
-                                          1000, 0, 600000000);
+                                          1000, 0, tdc_max);
             fMapTOT[fem_id][i] = new TH1F(Form("h1_tot_%s_ch%d", ip_str.c_str(), i), 
                                           Form("FEM %s TOT Ch%d;TOT;Counts", ip_str.c_str(), i), 
-                                          1000, 0, 100000);
+                                          1000, 0, tot_max);
             
             if (fServer) {
                 fServer->Register(Form("/FEM_%s/TDC", ip_str.c_str()), fMapTDC[fem_id][i]);
@@ -306,15 +327,37 @@ struct OnlineAnalysisNode : fair::mq::Device
         c_tdc_1->Divide(8, 4);
         TCanvas* c_tdc_2 = new TCanvas(Form("c_%s_tdc_32_63", ip_str.c_str()), Form("FEM %s TDC 32-63", ip_str.c_str()), 1600, 1000);
         c_tdc_2->Divide(8, 4);
+        TCanvas* c_tdc_3 = nullptr;
+        TCanvas* c_tdc_4 = nullptr;
+        
+        if (!is_hr) {
+            c_tdc_3 = new TCanvas(Form("c_%s_tdc_64_95", ip_str.c_str()), Form("FEM %s TDC 64-95", ip_str.c_str()), 1600, 1000);
+            c_tdc_3->Divide(8, 4);
+            c_tdc_4 = new TCanvas(Form("c_%s_tdc_96_127", ip_str.c_str()), Form("FEM %s TDC 96-127", ip_str.c_str()), 1600, 1000);
+            c_tdc_4->Divide(8, 4);
+        }
 
         TCanvas* c_tot_1 = new TCanvas(Form("c_%s_tot_0_31", ip_str.c_str()), Form("FEM %s TOT 0-31", ip_str.c_str()), 1600, 1000);
         c_tot_1->Divide(8, 4);
         TCanvas* c_tot_2 = new TCanvas(Form("c_%s_tot_32_63", ip_str.c_str()), Form("FEM %s TOT 32-63", ip_str.c_str()), 1600, 1000);
         c_tot_2->Divide(8, 4);
+        TCanvas* c_tot_3 = nullptr;
+        TCanvas* c_tot_4 = nullptr;
+
+        if (!is_hr) {
+            c_tot_3 = new TCanvas(Form("c_%s_tot_64_95", ip_str.c_str()), Form("FEM %s TOT 64-95", ip_str.c_str()), 1600, 1000);
+            c_tot_3->Divide(8, 4);
+            c_tot_4 = new TCanvas(Form("c_%s_tot_96_127", ip_str.c_str()), Form("FEM %s TOT 96-127", ip_str.c_str()), 1600, 1000);
+            c_tot_4->Divide(8, 4);
+        }
 
         for (int i = 1; i <= 32; ++i) {
             if (auto* p = c_tot_1->GetPad(i)) p->SetLogy(1);
             if (auto* p = c_tot_2->GetPad(i)) p->SetLogy(1);
+            if (!is_hr) {
+                if (auto* p = c_tot_3->GetPad(i)) p->SetLogy(1);
+                if (auto* p = c_tot_4->GetPad(i)) p->SetLogy(1);
+            }
         }
 
         for (int i = 0; i < 32; ++i) {
@@ -322,18 +365,42 @@ struct OnlineAnalysisNode : fair::mq::Device
             c_tot_1->cd(i+1); fMapTOT[fem_id][i]->Draw();
             c_tdc_2->cd(i+1); fMapTDC[fem_id][i+32]->Draw();
             c_tot_2->cd(i+1); fMapTOT[fem_id][i+32]->Draw();
+            
+            if (!is_hr) {
+                c_tdc_3->cd(i+1); fMapTDC[fem_id][i+64]->Draw();
+                c_tot_3->cd(i+1); fMapTOT[fem_id][i+64]->Draw();
+                c_tdc_4->cd(i+1); fMapTDC[fem_id][i+96]->Draw();
+                c_tot_4->cd(i+1); fMapTOT[fem_id][i+96]->Draw();
+            }
         }
 
         fCanvases.push_back(c_tdc_1);
         fCanvases.push_back(c_tdc_2);
+        if (!is_hr) {
+            fCanvases.push_back(c_tdc_3);
+            fCanvases.push_back(c_tdc_4);
+        }
+        
         fCanvases.push_back(c_tot_1);
         fCanvases.push_back(c_tot_2);
+        if (!is_hr) {
+            fCanvases.push_back(c_tot_3);
+            fCanvases.push_back(c_tot_4);
+        }
 
         if (fServer) {
             fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tdc_1);
             fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tdc_2);
+            if (!is_hr) {
+                fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tdc_3);
+                fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tdc_4);
+            }
             fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tot_1);
             fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tot_2);
+            if (!is_hr) {
+                fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tot_3);
+                fServer->Register(Form("/FEM_%s/Canvases", ip_str.c_str()), c_tot_4);
+            }
 
             fServer->SetItemField(Form("/FEM_%s", ip_str.c_str()), "_monitoring", "1000");
         }
@@ -356,12 +423,12 @@ struct OnlineAnalysisNode : fair::mq::Device
 private:
    std::string fInputChannelName;
    std::string fSamplingMode; // "all" or "latest"
+   int fPrescale = 1;
+   int fProcessCount = 0;
    std::unique_ptr<nestdaq::unpacker::LeafProcessor> fLeafProcessor;
    
    KTimer fDrawTimer;
 
-   TH1F* fH1TDC = nullptr;
-   TH1F* fH1TOT = nullptr;
    TH2F* fH2HitPattern = nullptr;
    
    // Map: FEM ID -> Vector of Channel Histograms
@@ -379,7 +446,8 @@ void addCustomOptions(bpo::options_description& options)
     using opt = OnlineAnalysisNode::OptionKey;
     options.add_options()
         (opt::InputChannelName.data(), bpo::value<std::string>()->default_value("in"), "Name of the input channel")
-        (opt::SamplingMode.data(), bpo::value<std::string>()->default_value("latest"), "Sampling mode: 'all' (process all) or 'latest' (drop old if slow)");
+        (opt::SamplingMode.data(), bpo::value<std::string>()->default_value("latest"), "Sampling mode: 'all' (process all) or 'latest' (drop old if slow)")
+        (opt::Prescale.data(), bpo::value<int>()->default_value(1), "Process only 1 in every N messages (default: 1, i.e., process all)");
 }
 
 std::unique_ptr<fair::mq::Device> getDevice(fair::mq::ProgOptions& /*config*/)

@@ -154,11 +154,16 @@ struct OnlineAnalysisTrigger : fair::mq::Device
 
             // 2. Process Hits (per FEM)
             for (auto const& [fem_id, tdc_data] : slice.data_by_fem) {
-                CheckAndCreateHistograms(fem_id);
-
+                int max_ch = 0;
                 int multiplicity = 0;
                 if (slice.fem_types.find(fem_id) == slice.fem_types.end()) continue;
                 int fem_type = slice.fem_types.at(fem_id);
+                bool is_hr = (fem_type == SubTimeFrame::TDC64H || fem_type == SubTimeFrame::TDC64H_V3);
+                
+                if (is_hr) max_ch = 64;
+                else max_ch = 128;
+
+                CheckAndCreateHistograms(fem_id, is_hr);
 
                 for (uint64_t word : tdc_data) {
                     int type = -1;
@@ -184,16 +189,21 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                          }
                     }
 
-                    if (ch >= 0 && ch < 64) {
+                    if (ch >= 0 && ch < max_ch) {
                         multiplicity++;
                         fMapHitPattern[fem_id]->Fill(ch);
                         
-                        long diff = static_cast<long>(tdc_val) - static_cast<long>(trg_time & 0x1FFFFFFF); 
-                        if (diff < -0x10000000) diff += 0x20000000;
-                        if (diff >  0x10000000) diff -= 0x20000000;
+                        long tdc_ps = is_hr ? static_cast<long>(tdc_val) : static_cast<long>(tdc_val) * 1024;
+                        long trg_ps = static_cast<long>(trg_time & 0x1FFFFFFF);
                         
-                        // 1ch ~ 1ps as requested
-                        fMapTDC[fem_id][ch]->Fill(diff);
+                        long diff_ps = tdc_ps - trg_ps; 
+                        
+                        if (diff_ps < -0x10000000) diff_ps += 0x20000000;
+                        if (diff_ps >  0x10000000) diff_ps -= 0x20000000;
+                        
+                        long final_diff = is_hr ? diff_ps : (diff_ps / 1024);
+                        
+                        fMapTDC[fem_id][ch]->Fill(final_diff);
                         fMapTOT[fem_id][ch]->Fill(tot);
                     }
                 } 
@@ -207,28 +217,31 @@ struct OnlineAnalysisTrigger : fair::mq::Device
         return std::to_string(ip[3]) + "." + std::to_string(ip[2]) + "." + std::to_string(ip[1]) + "." + std::to_string(ip[0]);
     }
 
-    void CheckAndCreateHistograms(uint32_t fem_id) {
+    void CheckAndCreateHistograms(uint32_t fem_id, bool is_hr) {
         if (fMapHitPattern.count(fem_id) > 0) return;
 
         std::string ip_str = ToIPAddress(fem_id);
-        LOG(info) << "Registering FEM ID: " << fem_id << " (" << ip_str << ")";
+        int max_ch = is_hr ? 64 : 128;
+        int max_pages = is_hr ? 4 : 8;
+
+        LOG(info) << "Registering FEM ID: " << fem_id << " (" << ip_str << ") - " << (is_hr ? "HR" : "LR");
 
         // Hit Pattern
         fMapHitPattern[fem_id] = new TH1F(Form("h1_hitpat_%s", ip_str.c_str()), 
                                           Form("FEM %s Hit Pattern;Channel;Counts", ip_str.c_str()), 
-                                          64, 0, 64);
+                                          max_ch, 0, max_ch);
         
         // Multiplicity
         fMapMultiplicity[fem_id] = new TH1F(Form("h1_multi_%s", ip_str.c_str()), 
                                             Form("FEM %s Multiplicity;Hits/Event;Counts", ip_str.c_str()), 
-                                            65, 0, 65);
+                                            max_ch + 1, 0, max_ch + 1);
 
         // TDC & TOT Vectors
-        fMapTDC[fem_id].resize(64, nullptr);
-        fMapTOT[fem_id].resize(64, nullptr);
+        fMapTDC[fem_id].resize(max_ch, nullptr);
+        fMapTOT[fem_id].resize(max_ch, nullptr);
 
         // Summary Canvases 
-        for (int page = 0; page < 4; ++page) {
+        for (int page = 0; page < max_pages; ++page) {
             auto* c = new TCanvas(Form("c_tdc_%s_p%d", ip_str.c_str(), page), 
                                   Form("FEM %s TDC Ch %d-%d", ip_str.c_str(), page*16, (page+1)*16-1), 
                                   800, 800);
@@ -237,7 +250,7 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             fServer->Register(Form("/FEM_%s/Canvas_TDC", ip_str.c_str()), c);
         }
 
-        for (int page = 0; page < 4; ++page) {
+        for (int page = 0; page < max_pages; ++page) {
             auto* c = new TCanvas(Form("c_tot_%s_p%d", ip_str.c_str(), page), 
                                   Form("FEM %s TOT Ch %d-%d", ip_str.c_str(), page*16, (page+1)*16-1), 
                                   800, 800);
@@ -247,16 +260,26 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             fServer->Register(Form("/FEM_%s/Canvas_TOT", ip_str.c_str()), c);
         }
 
-        for (int i = 0; i < 64; ++i) {
-            // TDC Range: -100000000 to +100000000 (ps) -> +/- 100us
-            fMapTDC[fem_id][i] = new TH1F(Form("h1_tdc_%s_ch%d", ip_str.c_str(), i), 
-                                          Form("FEM %s TDC Ch%d;Rel Time [ps];Counts", ip_str.c_str(), i), 
-                                          2000, -100000000, 100000000); 
-                                          
-            // TOT Range: 0 to 200000
-            fMapTOT[fem_id][i] = new TH1F(Form("h1_tot_%s_ch%d", ip_str.c_str(), i), 
-                                          Form("FEM %s TOT Ch%d;TOT;Counts", ip_str.c_str(), i), 
-                                          1000, 0, 200000); 
+        for (int i = 0; i < max_ch; ++i) {
+            if (is_hr) {
+                // HRTDC: TDC Range -100000000 to +100000000 (ps) -> +/- 100us
+                fMapTDC[fem_id][i] = new TH1F(Form("h1_tdc_%s_ch%d", ip_str.c_str(), i), 
+                                              Form("FEM %s TDC Ch%d;Rel Time [ps];Counts", ip_str.c_str(), i), 
+                                              2000, -100000000, 100000000); 
+                // HRTDC: TOT Range 0 to 200000
+                fMapTOT[fem_id][i] = new TH1F(Form("h1_tot_%s_ch%d", ip_str.c_str(), i), 
+                                              Form("FEM %s TOT Ch%d;TOT;Counts", ip_str.c_str(), i), 
+                                              1000, 0, 200000); 
+            } else {
+                // LRTDC: TDC Range -1000 to +1000 (ns) -> +/- 1us
+                fMapTDC[fem_id][i] = new TH1F(Form("h1_tdc_%s_ch%d", ip_str.c_str(), i), 
+                                              Form("FEM %s TDC Ch%d;Rel Time [ns];Counts", ip_str.c_str(), i), 
+                                              2000, -1000, 1000); 
+                // LRTDC: TOT Range 0 to 200 (仮)
+                fMapTOT[fem_id][i] = new TH1F(Form("h1_tot_%s_ch%d", ip_str.c_str(), i), 
+                                              Form("FEM %s TOT Ch%d;TOT;Counts", ip_str.c_str(), i), 
+                                              1000, 0, 200); 
+            } 
 
             if (fServer) {
                 fServer->Register(Form("/FEM_%s/TDC", ip_str.c_str()), fMapTDC[fem_id][i]);
