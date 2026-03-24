@@ -90,8 +90,16 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                 if (msg->GetSize() < sizeof(uint64_t)) continue;
                 uint64_t magic = *reinterpret_cast<uint64_t*>(msg->GetData());
                 
+                // DEBUG LOG
+                if (fMsgCount % 1000 == 0) {
+                    LOG(info) << "Received MsgSize: " << msg->GetSize() << " Magic: 0x" << std::hex << magic << std::dec;
+                }
+                fMsgCount++;
+
                 if (magic == TimeFrame::MAGIC) {
                      ProcessTimeFrame(*msg);
+                } else if (fMsgCount < 10) {
+                     LOG(warn) << "Unknown Magic in OnlineAnalysisSlicer: 0x" << std::hex << magic << std::dec;
                 }
             }
         }
@@ -112,7 +120,9 @@ struct OnlineAnalysisTrigger : fair::mq::Device
         fUnpacker.unpack();
         
         size_t num_slices = fUnpacker.get_num_slices();
-        if (num_slices > 0) LOG(info) << "MsgSize: " << size << " NumSlices: " << num_slices;
+        if (fMsgCount < 10 || num_slices > 0) {
+            LOG(info) << "ProcessTimeFrame - MsgSize: " << size << " NumSlices: " << num_slices;
+        }
 
         for (size_t i = 0; i < num_slices; ++i) {
             const auto& slice = fUnpacker.get_slice(i);
@@ -193,14 +203,22 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                         multiplicity++;
                         fMapHitPattern[fem_id]->Fill(ch);
                         
+                        // 1. まず「ps」単位に一度統一してから差分を計算する
+                        // （※前提として、HRTDCのtdc_valは1ps/ch、LRTDCは(1ns=1024ps)として1024倍しています）
                         long tdc_ps = is_hr ? static_cast<long>(tdc_val) : static_cast<long>(tdc_val) * 1024;
-                        long trg_ps = static_cast<long>(trg_time & 0x1FFFFFFF);
+                        
+                        // 修正：LogicFilterで生成される trg_time は「tdc4n（約4.096ns = 4096ps単位）」のインデックスです。
+                        // ps単位のtdc_psと差分をとるためには、4096を掛けてスケールを合わせる必要があります！
+                        long trg_ps = static_cast<long>(trg_time & 0x1FFFFFFF) * 4096L;
                         
                         long diff_ps = tdc_ps - trg_ps; 
                         
+                        // ロールオーバーの補正（統一したps基準での補正）
+                        // ※trg_time や tdc_val の桁数（ビット幅）によっては0x10000000の補正値も合わせる必要があります
                         if (diff_ps < -0x10000000) diff_ps += 0x20000000;
                         if (diff_ps >  0x10000000) diff_ps -= 0x20000000;
                         
+                        // 2. ヒストグラムに詰める際に、LRはns、HRはpsに直す
                         long final_diff = is_hr ? diff_ps : (diff_ps / 1024);
                         
                         fMapTDC[fem_id][ch]->Fill(final_diff);
@@ -312,6 +330,7 @@ struct OnlineAnalysisTrigger : fair::mq::Device
 private:
     std::string fInputChannelName;
     TFSlicerUnpacker fUnpacker;
+    uint64_t fMsgCount = 0;
     
     THttpServer* fServer = nullptr;
     KTimer fDrawTimer;
