@@ -34,7 +34,7 @@ public:
 
     // Accessors
     const Filter::Header* get_filter_header() const { return m_filter_header; }
-    size_t get_num_slices() const { return m_slices.size(); }
+    size_t get_num_slices() const;
     const SliceData& get_slice(size_t index) const;
 
 private:
@@ -42,6 +42,7 @@ private:
     size_t m_size = 0; // Size in bytes
     
     Filter::Header* m_filter_header = nullptr;
+    size_t m_num_slices;
     std::vector<SliceData> m_slices;
 
     void parse_slices();

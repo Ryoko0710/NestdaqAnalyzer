@@ -1,4 +1,3 @@
-#include <fairmq/Device.h>
 #include <fairmq/runDevice.h>
 
 #include <iostream>
@@ -56,52 +55,84 @@ struct OnlineAnalysisTrigger : fair::mq::Device
             LOG(info) << "HTTP Server started on port 8889";
         }
 
-        // Initialize Global Histograms
-        // Trigger interval: 0-25 us
-        fH1TrigInterval = new TH1F("h1_trig_interval", "Trigger Interval;Time [us];Counts", 1000, 0, 25);  
-        fH1TrigTime     = new TH1F("h1_trig_time", "Trigger Time Distribution;Time [s];Counts", 1000, 0, 10e-6); 
+        // Initialize Global Histograms - Guard against duplication
+        if (!fH1TrigInterval) {
+            fH1TrigInterval = new TH1F("h1_trig_interval", "Trigger Interval;Time [us];Counts", 1000, 0, 100);  
+            fH1TrigTime     = new TH1F("h1_trig_time", "Trigger Time Distribution;Time [s];Counts", 1000, 0, 1.0); 
 
-        // Summary Canvas
-        fCanvasSummary = new TCanvas("c_summary", "Summary", 800, 800);
-        fCanvasSummary->Divide(1, 2);
-        fCanvasSummary->cd(1)->SetLogy(); // LogY for Interval
-        
-        if (fServer) {
-            fServer->Register("/Summary", fH1TrigInterval);
-            fServer->Register("/Summary", fH1TrigTime);
-            fServer->Register("/Summary", fCanvasSummary);
+            fCanvasSummary = new TCanvas("c_summary", "Summary", 800, 800);
+            fCanvasSummary->Divide(1, 2);
+            fCanvasSummary->cd(1)->SetLogy(); // LogY for Interval
             
-            fCanvasSummary->cd(1); fH1TrigInterval->Draw();
-            fCanvasSummary->cd(2); fH1TrigTime->Draw();
+            if (fServer) {
+                fServer->Register("/Summary", fH1TrigInterval);
+                fServer->Register("/Summary", fH1TrigTime);
+                fServer->Register("/Summary", fCanvasSummary);
+                
+                fCanvasSummary->cd(1); fH1TrigInterval->Draw();
+                fCanvasSummary->cd(2); fH1TrigTime->Draw();
 
-            fServer->SetItemField("/", "_monitoring", "1000");
-            fServer->SetItemField("/Summary", "_monitoring", "1000");
+                fServer->SetItemField("/", "_monitoring", "1000");
+                fServer->SetItemField("/Summary", "_monitoring", "1000");
+            }
+        } else {
+            fH1TrigInterval->Reset();
+            fH1TrigTime->Reset();
         }
 
         fDrawTimer.SetDuration(100); 
+    }
+
+    void PreRun() override
+    {
+        LOG(info) << "OnlineAnalysisTrigger: PreRun - Resetting histograms for new run.";
+        ResetHistograms();
+    }
+
+    void ResetHistograms()
+    {
+        if (fH1TrigInterval) fH1TrigInterval->Reset();
+        if (fH1TrigTime)     fH1TrigTime->Reset();
+        for (auto& [id, h] : fMapHitPattern) {
+            if (h) h->Reset();
+        }
+        for (auto& [id, h] : fMapMultiplicity) {
+            if (h) h->Reset();
+        }
+        for (auto& [id, vec] : fMapTDC) {
+            for (auto* h : vec) if (h) h->Reset();
+        }
+        for (auto& [id, vec] : fMapTOT) {
+            for (auto* h : vec) if (h) h->Reset();
+        }
+        fLastTrigTime = 0;
+        fFirstTrigTime = 0;
+        fMsgCount = 0;
+        LOG(info) << "OnlineAnalysisTrigger: Histograms reset completed.";
     }
 
     bool ConditionalRun() override
     {
         FairMQParts parts;
         if (Receive(parts, fInputChannelName, 0, 100) > 0) {
-            // Processing
-            for (auto& msg : parts) {
-                if (msg->GetSize() < sizeof(uint64_t)) continue;
-                uint64_t magic = *reinterpret_cast<uint64_t*>(msg->GetData());
-                
-                // DEBUG LOG
-                if (fMsgCount % 1000 == 0) {
-                    LOG(info) << "Received MsgSize: " << msg->GetSize() << " Magic: 0x" << std::hex << magic << std::dec;
-                }
-                fMsgCount++;
+            fMsgCount++;
 
-                if (magic == TimeFrame::MAGIC) {
-                     ProcessTimeFrame(*msg);
-                } else if (fMsgCount < 10) {
-                     LOG(warn) << "Unknown Magic in OnlineAnalysisSlicer: 0x" << std::hex << magic << std::dec;
-                }
+            // Merge all parts into a single aligned buffer
+            size_t total_size = 0;
+            for (const auto& msg : parts) total_size += msg->GetSize();
+            if (total_size == 0) return true;
+
+            size_t n_words = (total_size + 7) / 8;
+            std::vector<uint64_t> merged_buffer(n_words, 0);
+            uint8_t* dest_ptr = reinterpret_cast<uint8_t*>(merged_buffer.data());
+            size_t offset = 0;
+            for (const auto& msg : parts) {
+                std::memcpy(dest_ptr + offset, msg->GetData(), msg->GetSize());
+                offset += msg->GetSize();
             }
+
+            // Unpack from merged buffer
+            ProcessTimeFrame(merged_buffer.data(), total_size);
         }
 
         if (fDrawTimer.Check()) {
@@ -111,33 +142,20 @@ struct OnlineAnalysisTrigger : fair::mq::Device
         return true;
     }
 
-    void ProcessTimeFrame(fair::mq::Message& msg)
+    void ProcessTimeFrame(uint64_t* data, size_t size)
     {
-        uint64_t* data = reinterpret_cast<uint64_t*>(msg.GetData());
-        size_t size = msg.GetSize();
-
         fUnpacker.set_data(data, size);
         fUnpacker.unpack();
         
         size_t num_slices = fUnpacker.get_num_slices();
-        if (fMsgCount < 10 || num_slices > 0) {
-            LOG(info) << "ProcessTimeFrame - MsgSize: " << size << " NumSlices: " << num_slices;
-        }
 
         for (size_t i = 0; i < num_slices; ++i) {
             const auto& slice = fUnpacker.get_slice(i);
             
-            // Check if this is a valid TDC Trigger Slice
-            // We want to process PHYSICS TRIGGERS (Type 0x10) to see TDC peaks.
-            // Heartbeats (0xAA...) contain uncorrelated noise which flattens the distribution.
-            // Header (0x45...) should be skipped.
-            
-            bool is_physics = (slice.trigger_info.type & 0xFFFF) == 0x10; // Check standard low bits
-            // Or simple exact match if masking upper bits?
-            // Log showed "Type: 16".
+            // Logically process PHYSICS TRIGGERS
+            bool is_physics = true; // Use all slices from LogicFilter (already physics-triggered)
             
             if (!is_physics) {
-                // Skip Heartbeats and Headers for histograms to avoid washing out peaks
                 continue; 
             }
             
@@ -209,9 +227,15 @@ struct OnlineAnalysisTrigger : fair::mq::Device
                         
                         // 修正：LogicFilterで生成される trg_time は「tdc4n（約4.096ns = 4096ps単位）」のインデックスです。
                         // ps単位のtdc_psと差分をとるためには、4096を掛けてスケールを合わせる必要があります！
-                        long trg_ps = static_cast<long>(trg_time & 0x1FFFFFFF) * 4096L;
+                        long trg_ps = static_cast<long>(trg_time & 0xFFFFFFFF) * 4096L;
                         
                         long diff_ps = tdc_ps - trg_ps; 
+                        
+                        static int log_cnt = 0;
+                        if (log_cnt++ < 20) {
+                            LOG(info) << "Slicer Debug: tdc_ps=" << tdc_ps << " trg_time=" << trg_time 
+                                      << " trg_ps=" << trg_ps << " diff_ps=" << diff_ps;
+                        }
                         
                         // ロールオーバーの補正（統一したps基準での補正）
                         // ※trg_time や tdc_val の桁数（ビット幅）によっては0x10000000の補正値も合わせる必要があります
@@ -280,10 +304,10 @@ struct OnlineAnalysisTrigger : fair::mq::Device
 
         for (int i = 0; i < max_ch; ++i) {
             if (is_hr) {
-                // HRTDC: TDC Range -100000000 to +100000000 (ps) -> +/- 100us
+                // HRTDC: TDC Range +/- 1us
                 fMapTDC[fem_id][i] = new TH1F(Form("h1_tdc_%s_ch%d", ip_str.c_str(), i), 
                                               Form("FEM %s TDC Ch%d;Rel Time [ps];Counts", ip_str.c_str(), i), 
-                                              2000, -100000000, 100000000); 
+                                              2000, -1000000, 1000000); 
                 // HRTDC: TOT Range 0 to 200000
                 fMapTOT[fem_id][i] = new TH1F(Form("h1_tot_%s_ch%d", ip_str.c_str(), i), 
                                               Form("FEM %s TOT Ch%d;TOT;Counts", ip_str.c_str(), i), 

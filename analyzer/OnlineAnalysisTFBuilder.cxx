@@ -62,9 +62,9 @@ struct OnlineAnalysisNode : fair::mq::Device
 
         fDrawTimer.SetDuration(100); 
 
-        // Global Histograms (All FEMs aggregated)
+        // Global Histograms (All FEMs aggregated) - Guard against duplicates
+        if (!fH2HitPattern) {
              fH2HitPattern = new TH2F("h2_hitpat", "Hit Pattern;Channel;FEM ID", 128, 0, 128, 10, 0, 10);
-             
              if(fServer) {
                  fServer->Register("/Summary", fH2HitPattern);
                  
@@ -72,8 +72,33 @@ struct OnlineAnalysisNode : fair::mq::Device
                  fServer->SetItemField("/", "_monitoring", "1000");
                  fServer->SetItemField("/Summary", "_monitoring", "1000");
              }
+        } else {
+            fH2HitPattern->Reset();
+        }
         
         LOG(info) << "DEBUG: InitTask Finished.";
+    }
+
+    void PreRun() override
+    {
+        LOG(info) << "OnlineAnalysisNode: PreRun - Resetting histograms for new run.";
+        ResetHistograms();
+    }
+
+    void ResetHistograms()
+    {
+        if (fH2HitPattern) fH2HitPattern->Reset();
+        for (auto& [id, h] : fMapHitPattern) {
+            if (h) h->Reset();
+        }
+        for (auto& [id, vec] : fMapTDC) {
+            for (auto* h : vec) if (h) h->Reset();
+        }
+        for (auto& [id, vec] : fMapTOT) {
+            for (auto* h : vec) if (h) h->Reset();
+        }
+        fProcessCount = 0;
+        LOG(info) << "OnlineAnalysisNode: Histograms reset completed.";
     }
 
     bool ConditionalRun() override
